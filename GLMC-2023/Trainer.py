@@ -60,7 +60,7 @@ class Trainer(object):
             weighted_train_loader = iter(self.weighted_train_loader)
 
             for i, (inputs, targets) in enumerate(self.train_loader):
-                print('hi')
+                #print('hi')
                 input_org_1 = inputs[0]
                 input_org_2 = inputs[1]
                 target_org = targets

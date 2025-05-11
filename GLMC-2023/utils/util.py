@@ -172,6 +172,7 @@ def prepare_folders(args):
 
 def save_checkpoint(args, state, is_best, epoch):
     filename = '%s/%s/ckpt.pth.tar' % (args.root_model, args.store_name)
+    os.makedirs(os.path.dirname(filename), exist_ok=True)
     torch.save(state, filename)
     if is_best:
         shutil.copyfile(filename, filename.replace('pth.tar', 'best.pth.tar'))
