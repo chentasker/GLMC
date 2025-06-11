@@ -86,7 +86,7 @@ class ResNet_modify(nn.Module):
 
         return nn.Sequential(*layers)
 
-    def forward(self, x, train=False):
+    def forward(self, x, train=False, extract_features=False):
         out = F.relu(self.bn1(self.conv1(x)))
         out = self.layer1(out)
         out = self.layer2(out)
@@ -99,6 +99,8 @@ class ResNet_modify(nn.Module):
             out_cb = self.fc_cb(feature)
             z = self.projection_head(feature)
             p = self.contrast_head(z)
+            if extract_features:
+                return out,out_cb,z,p,feature
             return out, out_cb, z, p
         else:
             out = self.fc_cb(feature)

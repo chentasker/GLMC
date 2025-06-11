@@ -219,7 +219,7 @@ class ResNet(nn.Module):
 
         return nn.Sequential(*layers)
 
-    def _forward_impl(self, x, train=True):
+    def _forward_impl(self, x, train=True, extract_features=False):
         # See note [TorchScript super()]
         x = self.conv1(x)
         x = self.bn1(x)
@@ -238,13 +238,30 @@ class ResNet(nn.Module):
             out_cb = self.fc_cb(feats)
             z = self.projection_head(feats)
             p = self.contrast_head(z)
+            if extract_features:
+                return x,out_cb,z,p,feats
             return x,out_cb,z,p
         else:
             out_cb = self.fc_cb(feats)
             return out_cb
+    
+    def _get_features(self, x):
+        x = self.conv1(x)
+        x = self.bn1(x)
+        x = self.relu(x)
+        x = self.maxpool(x)
 
-    def forward(self, x, train=True):
-        return self._forward_impl(x, train=train)
+        x = self.layer1(x)
+        x = self.layer2(x)
+        x = self.layer3(x)
+        x = self.layer4(x)
+
+        x = self.avgpool(x)
+        feats = torch.flatten(x, 1)
+        return feats
+
+    def forward(self, x, train=True, extract_features=False):
+        return self._forward_impl(x, train=train, extract_features=extract_features)
 
     def SimSiamLoss(p, z, version='simplified'):  # negative cosine similarity
         if version == 'original':
