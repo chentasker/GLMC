@@ -1,3 +1,4 @@
+#%%
 from collections import defaultdict
 import os.path
 
@@ -22,8 +23,8 @@ import argparse
 import time
 
 dataset = 'iNaturelist2018'
-dataset = 'imagenet'
-dataset = 'cifar10'
+#dataset = 'imagenet'
+dataset = 'cifar100'
 
 parser = argparse.ArgumentParser(description="Global and Local Mixture Consistency Cumulative Learning")
 parser.add_argument('--dataset', type=str, default='cifar100', help="cifar10,cifar100,ImageNet-LT,iNaturelist2018")
@@ -334,7 +335,6 @@ end_time = time.time()
 print("It took {} to execute the program".format(hms_string(end_time - start_time)))
 
 #%% Create KZ Dataset
-
 if dataset == 'cifar10':
     train_dataset = cifar10Imbanlance.Cifar10Imbanlance(transform=transform_val,imbanlance_rate=args.imbanlance_rate, train=True,file_path=args.root)
     
@@ -359,22 +359,28 @@ train_loader = torch.utils.data.DataLoader(train_dataset,
 
 feature_dim = model.module.fc_cb.in_features
 
+fc = model.module.fc_cb
+#fc = pretrained_model.fc[1]
+
 model.eval()
 # Get KZ
 with torch.no_grad():
     #model = model.cpu()
-    kz_tensor_for_coarse = defaultdict(lambda: torch.zeros(0, 256))
-    pi_tensor_for_coarse = defaultdict(lambda: torch.zeros(0, 256))
+    kz_tensor_for_coarse = defaultdict(lambda: torch.zeros(0, feature_dim))
+    pi_tensor_for_coarse = defaultdict(lambda: torch.zeros(0, feature_dim))
     targets_for_coarse = defaultdict(list)
 
     for i in range(len(train_dataset)):
         data, target = train_dataset[i]
         data = data.to(device).unsqueeze(0)
-        coarse_label = coarse_labels[target]            
+        #coarse_label = coarse_labels[target]      
+        coarse_label = target
+        
         _, _, _, _, features = model.module(data, train=True, extract_features=True)
-            
-        outputs = classifier(features)
-        pi = (torch.linalg.pinv(classifier.weight.data) @ (outputs - classifier.bias.data).T).T
+        #features = pretrained_get_features(pretrained_model, data)
+        outputs = fc(features)
+        
+        pi = (torch.linalg.pinv(fc.weight.data) @ (outputs - fc.bias.data).T).T
         kz = features - pi
         
         kz_tensor_for_coarse[coarse_label] = np.concatenate((kz_tensor_for_coarse[coarse_label], kz.cpu().numpy()), axis=0)
@@ -395,7 +401,7 @@ def get_pca_directions(X, k):
 top_directions_for_coarse = {}
 for coarse_label in range(num_coarse_labels):
     top_directions, top_ev = get_pca_directions(kz_tensor_for_coarse[coarse_label], directions_num)
-    top_directions_for_coarse[coarse_label] = torch.tensor(top_directions).float()
+    top_directions_for_coarse[coarse_label] = top_directions
     
 top_directions_all, top_ev_all = get_pca_directions(np.concatenate(list(kz_tensor_for_coarse.values()), axis=0), directions_num)
 
@@ -427,7 +433,7 @@ class ImbanlanceAugmented(Dataset):
         y = item // self.get_num_per_class()
         idx_in_class = item % self.get_num_per_class()
         coarse_label = self.fine_to_coarse[y]
-        if idx_in_class < 0*self.orig_per_class_num[y]:
+        if idx_in_class < self.orig_per_class_num[y]:
             row = self.targets[coarse_label].index(y) + idx_in_class
             x = self.kz_dataset[coarse_label][row, :] + self.pi_dataset[coarse_label][row, :]
         else:
@@ -439,20 +445,54 @@ class ImbanlanceAugmented(Dataset):
             if self.top_dir is None:
                 kz = self.kz_dataset[coarse_label][kz_row, :]
             else:
-                kz = np.random.rand(self.top_dir.shape[0]) @ self.top_dir
+                kz = np.random.rand(self.top_dir[coarse_label].shape[0]) @ self.top_dir[coarse_label]
             #kz = self.kz_dataset[coarse_label][pi_row, :] # Turns this into simple over-sampling dataset
             
-            x = self.kz_dataset[coarse_label][kz_row, :] + self.pi_dataset[coarse_label][pi_row, :]
+            x = kz + self.pi_dataset[coarse_label][pi_row, :]
         return x.squeeze().detach(), y
     
-augmented_dataset = ImbanlanceAugmented({k:torch.tensor(v) for k,v in pi_tensor_for_coarse.items()},
-                                        {k:torch.tensor(v) for k,v in kz_tensor_for_coarse.items()},
-                                        targets_for_coarse,
+
+class OversampledDataset(Dataset):
+    def __init__(self, dataset):
+        self.dataset = dataset
+        
+        self.class_to_indices = defaultdict(list)
+        for idx in range(len(dataset)):
+            _, label = dataset[idx]
+            self.class_to_indices[label].append(idx)
+    
+        self.max_class_size = max(len(indices) for indices in self.class_to_indices.values())
+        self.total_len = self.max_class_size * len(self.class_to_indices.keys())
+    
+    def __len__(self):
+        return self.total_len
+    
+    def __getitem__(self, item):
+        class_id = item // self.max_class_size
+        position = item % self.max_class_size
+
+        class_indices = self.class_to_indices[class_id]
+        true_idx = class_indices[position % len(class_indices)]
+
+        return self.dataset[true_idx]
+        
+augmented_dataset = ImbanlanceAugmented(pi={k:torch.tensor(v) for k,v in pi_tensor_for_coarse.items()},
+                                        kz={k:torch.tensor(v) for k,v in kz_tensor_for_coarse.items()},
+                                        targets=targets_for_coarse,
                                         fine_to_coarse=coarse_labels,
-                                        #top_dir=top_directions_all
+                                        #top_dir=top_directions_for_coarse
                                         )
 
 augmented_loader = torch.utils.data.DataLoader(augmented_dataset,
+                                           batch_size=args.batch_size,
+                                           shuffle=True,
+                                           num_workers=4,
+                                           persistent_workers=True,
+                                           pin_memory=True,
+                                           sampler=train_sampler)
+
+oversampled_dataset = OversampledDataset(train_dataset)
+oversampled_loader = torch.utils.data.DataLoader(oversampled_dataset,
                                            batch_size=args.batch_size,
                                            shuffle=True,
                                            num_workers=4,
@@ -478,14 +518,15 @@ with torch.no_grad():
 
 criterion = torch.nn.CrossEntropyLoss()
 optimizer = torch.optim.SGD(classifier.parameters(), momentum=0.9, lr=1e-3, weight_decay=1e-3)
-scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=20, gamma=0.1)
+scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=30, gamma=0.1)
 
 model.eval()
-for epoch in range(100):
-    for batch_idx, (data, target) in enumerate(augmented_loader):
+for epoch in range(10):
+    for batch_idx, (data, target) in enumerate(oversampled_loader):
         classifier.train()
         data, target = data.to(device), target.to(device)
         optimizer.zero_grad()
+        _,_,_,_,data = model(data, train=True, extract_features=True)
         outputs = classifier(data)
         loss = criterion(outputs, target.to(torch.long))
         loss.backward()
@@ -524,6 +565,22 @@ for epoch in range(100):
 
 
 #classifier = model.module.fc_cb
+#%%
+count = {i: 0 for i in range(100)}
+for i in range(len(augmented_dataset)):
+    data, target = augmented_dataset[i]
+    data = data.unsqueeze(0).to(device)
+    idx_in_class = i % augmented_dataset.get_num_per_class()
+    if i < augmented_dataset.orig_per_class_num[target]:
+        continue
+    idx_of_pi = idx_in_class % augmented_dataset.orig_per_class_num[target]
+    pi_data = augmented_dataset[i - (idx_in_class - idx_of_pi)][0].unsqueeze(0).to(device)
+    current_correct = classifier(data).argmax() == target
+    orig_correct = classifier(pi_data).argmax() == target
+    if orig_correct != current_correct:
+        count[target] += 1
+    
+
 #%%
 criterion = torch.nn.CrossEntropyLoss()
 
@@ -825,5 +882,97 @@ scatter_pca_pairs(kz_tensor_for_coarse[coarse_label],targets_for_coarse[coarse_l
 print(acc_per_coarse[coarse_label])
 
 #%%
-mean_per_coarse = [kz.mean(0) for kz in kz_tensor_for_coarse.values()]
-std_per_coarse = [kz.std(0) for kz in kz_tensor_for_coarse.values()]
+from collections import Counter
+from torch.utils.data import WeightedRandomSampler
+def pretrained_get_features(pretrained_model, x):
+        x = pretrained_model.conv1(x)
+        x = pretrained_model.bn1(x)
+        x = pretrained_model.relu(x)
+        x = pretrained_model.maxpool(x)
+
+        x = pretrained_model.layer1(x)
+        x = pretrained_model.layer2(x)
+        x = pretrained_model.layer3(x)
+        x = pretrained_model.layer4(x)
+
+        x = pretrained_model.avgpool(x)
+        x = torch.flatten(x, 1)
+        x = pretrained_model.fc[0](x)
+        return x
+
+import torchvision.models as models
+pretrained_model = models.resnet50(pretrained=True).to(device)
+pretrained_model.eval()
+
+# Basic transform for ResNet-50 (trained on ImageNet)
+transform = transforms.Compose([
+    transforms.Resize(224),
+    transforms.ToTensor(),
+    transforms.Normalize(mean=[0.485, 0.456, 0.406],
+                         std=[0.229, 0.224, 0.225])
+])
+
+if dataset == 'cifar10':
+    train_dataset = cifar10Imbanlance.Cifar10Imbanlance(transform=transform_val,
+                                                        imbanlance_rate=args.imbanlance_rate,
+                                                        train=True,
+                                                        file_path=args.root,
+                                                        print_on_creation=False
+                                                        )
+    
+if dataset == 'cifar100':
+    train_dataset = cifar100Imbanlance.Cifar100Imbanlance(transform=transform_val,
+                                                          imbanlance_rate=args.imbanlance_rate,
+                                                          train=True,
+                                                          file_path=os.path.join('data/','cifar-100-python/'),
+                                                          print_on_creation=False
+                                                          )
+
+if dataset == 'ImageNet-LT':
+    train_dataset = dataset_lt_data.LT_Dataset(args.root, 'data/data_txt/ImageNet_LT_train.txt',transform_val)
+
+labels = [label for _, label in train_dataset]  # train_dataset is your CIFAR-10-LT
+class_counts = Counter(labels)
+max_count = max(class_counts.values())
+weights = [max_count / class_counts[label] for _, label in train_dataset]
+sampler = WeightedRandomSampler(weights, num_samples=len(train_dataset), replacement=True)
+train_loader = DataLoader(train_dataset, batch_size=64, sampler=sampler, num_workers=4)
+#train_loader = DataLoader(train_dataset, batch_size=64, shuffle=True, num_workers=4)
+
+pretrained_model.fc = torch.nn.Sequential(torch.nn.Linear(pretrained_model.fc.in_features, 256), torch.nn.Linear(256, 10)).to(device)
+
+criterion = torch.nn.CrossEntropyLoss()
+optimizer = torch.optim.SGD(pretrained_model.parameters(), lr=0.01, momentum=0.9, weight_decay=1e-4)
+scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=15, gamma=0.1)
+
+for epoch in range(10):  # adjust epochs as needed
+    pretrained_model.train()
+    total_loss = 0
+    for images, labels in train_loader:
+        images, labels = images.to(device), labels.to(device)
+        
+        optimizer.zero_grad()
+        outputs = pretrained_model(images)
+        loss = criterion(outputs, labels)
+        loss.backward()
+        optimizer.step()
+
+        total_loss += loss.item()
+    
+    print(f"Epoch [{epoch+1}/10] Loss: {total_loss:.4f}")
+    scheduler.step()
+    
+    pretrained_model.eval()
+    correct = 0
+    total = 0
+    with torch.no_grad():
+        for images, labels in val_loader:
+            images, labels = images.to(device), labels.to(device)
+            outputs = pretrained_model(images)
+            _, predicted = torch.max(outputs.data, 1)
+            total += labels.size(0)
+            correct += (predicted == labels).sum().item()
+    
+    print(f"Validation Accuracy: {100 * correct / total:.2f}%")
+
+#%%

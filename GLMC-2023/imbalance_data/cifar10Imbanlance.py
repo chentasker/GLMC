@@ -6,14 +6,17 @@ from PIL import Image
 
 class Cifar10Imbanlance(Dataset):
     def __init__(self, imbanlance_rate, num_cls=10, file_path="data/",
-                 train=True, transform=None, label_align=True, ):
+                 train=True, transform=None, label_align=True, print_on_creation=True):
         self.transform = transform
         self.label_align = label_align
         assert 0.0 < imbanlance_rate < 1, "imbanlance_rate must 0.0 < imbanlance_rate < 1"
         self.imbanlance_rate = imbanlance_rate
 
         self.num_cls = num_cls
-        self.data = self.produce_imbanlance_data(file_path=file_path, train=train,imbanlance_rate=self.imbanlance_rate)
+        self.data = self.produce_imbanlance_data(file_path=file_path,
+                                                 train=train,
+                                                 imbanlance_rate=self.imbanlance_rate, 
+                                                 print_on_creation=print_on_creation)
         self.x = self.data['x']
         self.targets = self.data['y'].tolist()
         self.y = self.data['y'].tolist()
@@ -31,7 +34,7 @@ class Cifar10Imbanlance(Dataset):
     def get_per_class_num(self):
         return self.class_list
 
-    def produce_imbanlance_data(self, imbanlance_rate, file_path="/data", train=True):
+    def produce_imbanlance_data(self, imbanlance_rate, file_path="/data", train=True, print_on_creation=True):
 
         train_data = torchvision.datasets.CIFAR10(
             root=file_path,
@@ -55,7 +58,7 @@ class Cifar10Imbanlance(Dataset):
             else:
                 num = data_num
                 data_percent.append(int(num))
-        if train:
+        if train and print_on_creation:
             print("imbanlance_ration is {}".format(data_percent[0] / data_percent[-1]))
             print("per class num: {}".format(data_percent))
 

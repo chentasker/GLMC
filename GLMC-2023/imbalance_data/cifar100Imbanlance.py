@@ -12,7 +12,7 @@ from torchvision import transforms
 
 class Cifar100Imbanlance(Dataset):
     def __init__(self, imbanlance_rate=0.1, file_path="data/cifar-100-python/", num_cls=100, transform=None,
-                 train=True):
+                 train=True, print_on_creation=True):
         self.transform = transform
         assert 0.0 < imbanlance_rate < 1, "imbanlance_rate must 0.0 < p < 1"
         self.num_cls = num_cls
@@ -20,7 +20,7 @@ class Cifar100Imbanlance(Dataset):
         self.imbanlance_rate = imbanlance_rate
 
         if train is True:
-            self.data = self.produce_imbanlance_data(self.imbanlance_rate)
+            self.data = self.produce_imbanlance_data(self.imbanlance_rate, print_on_creation)
         else:
             self.data = self.produce_test_data()
         self.x = self.data['x']
@@ -52,7 +52,7 @@ class Cifar100Imbanlance(Dataset):
 
         return dataset
 
-    def produce_imbanlance_data(self, imbanlance_rate):
+    def produce_imbanlance_data(self, imbanlance_rate, print_on_creation):
 
         with open(os.path.join(self.file_path,"train"), 'rb') as fo:
             dict = pickle.load(fo, encoding='bytes')
@@ -71,8 +71,9 @@ class Cifar100Imbanlance(Dataset):
             data_percent.append(int(num))
 
         self.per_class_num = data_percent
-        print("imbanlance ration is {}".format(data_percent[0] / data_percent[-1]))
-        print("per class num：{}".format(data_percent))
+        if print_on_creation:
+            print("imbanlance ration is {}".format(data_percent[0] / data_percent[-1]))
+            print("per class num：{}".format(data_percent))
 
         for i in range(1, self.num_cls + 1):
             a1 = y_train >= i - 1
