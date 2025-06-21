@@ -368,13 +368,14 @@ with torch.no_grad():
     #model = model.cpu()
     kz_tensor_for_coarse = defaultdict(lambda: torch.zeros(0, feature_dim))
     pi_tensor_for_coarse = defaultdict(lambda: torch.zeros(0, feature_dim))
+    kz_tensor_for_class = defaultdict(lambda: torch.zeros(0, feature_dim))
+    pi_tensor_for_class = defaultdict(lambda: torch.zeros(0, feature_dim))
     targets_for_coarse = defaultdict(list)
 
     for i in range(len(train_dataset)):
         data, target = train_dataset[i]
         data = data.to(device).unsqueeze(0)
-        #coarse_label = coarse_labels[target]      
-        coarse_label = target
+        coarse_label = coarse_labels[target]    
         
         _, _, _, _, features = model.module(data, train=True, extract_features=True)
         #features = pretrained_get_features(pretrained_model, data)
@@ -385,10 +386,12 @@ with torch.no_grad():
         
         kz_tensor_for_coarse[coarse_label] = np.concatenate((kz_tensor_for_coarse[coarse_label], kz.cpu().numpy()), axis=0)
         pi_tensor_for_coarse[coarse_label] = np.concatenate((pi_tensor_for_coarse[coarse_label], pi.cpu().numpy()), axis=0)
+        kz_tensor_for_class[target] = np.concatenate((kz_tensor_for_class[target], kz.cpu().numpy()), axis=0)
+        pi_tensor_for_class[target] = np.concatenate((pi_tensor_for_class[target], pi.cpu().numpy()), axis=0)
+        
         targets_for_coarse[coarse_label] += [target]
     model.to(device)
-#%%
-# Find top directions in KZ
+#%% Find top directions in KZ
 directions_num = 5
 def get_pca_directions(X, k):
     # X: n x d data matrix
@@ -414,11 +417,27 @@ class ImbanlanceAugmented(Dataset):
         self.pi_dataset = pi
         self.targets = targets
         self.fine_to_coarse = fine_to_coarse
-        num_coarse_labels = max(fine_to_coarse)
+        num_coarse_labels = max(fine_to_coarse) + 1
         self.coarse_to_fine = [list(np.where(fine_to_coarse==i)[0]) for i in range(num_coarse_labels)]
         self.feat_dim = pi[0][0].shape[0]
-        self.orig_per_class_num = [self.targets[coarse].count(fine) for fine, coarse in enumerate(self.fine_to_coarse)]
+        #self.orig_per_class_num = [self.targets[coarse].count(fine) for fine, coarse in enumerate(self.fine_to_coarse)]
+        self.orig_per_class_num = [self.pi_dataset[c].shape[0] for c in self.pi_dataset.keys()]
         self.top_dir = top_dir
+        
+        self.kz_info = {}
+        for c, X in self.kz_dataset.items():
+            mean = X.mean(dim=0)
+            X_centered = X - mean
+            cov = X_centered.T @ X_centered / (X_centered.shape[0] - 1)
+            eigenvalues, eigenvectors = torch.linalg.eigh(cov)
+            first_pc = eigenvectors[:, -1]  # shape: (d,)
+            first_eigenvalue = eigenvalues[-1]
+            
+            self.kz_info[c] = {'mean': mean,
+                               'first_pc': first_pc,
+                               'std': first_eigenvalue.sqrt(),
+                               }
+            
     
     def get_num_classes(self):
         return len(self.fine_to_coarse)
@@ -432,23 +451,31 @@ class ImbanlanceAugmented(Dataset):
     def __getitem__(self, item):
         y = item // self.get_num_per_class()
         idx_in_class = item % self.get_num_per_class()
-        coarse_label = self.fine_to_coarse[y]
         if idx_in_class < self.orig_per_class_num[y]:
-            row = self.targets[coarse_label].index(y) + idx_in_class
-            x = self.kz_dataset[coarse_label][row, :] + self.pi_dataset[coarse_label][row, :]
+            x = self.kz_dataset[y][idx_in_class, :] + self.pi_dataset[y][idx_in_class, :]
         else:
             # get random sample from said class
-            #pi_idx_in_class = torch.randint(low=0, high=self.orig_per_class_num[y], size=(1,))
-            pi_idx_in_class = idx_in_class % self.orig_per_class_num[y]
-            pi_row = self.targets[coarse_label].index(y) + pi_idx_in_class
-            kz_row = torch.randint(low=0, high=self.kz_dataset[coarse_label].shape[0], size=(1,))
-            if self.top_dir is None:
-                kz = self.kz_dataset[coarse_label][kz_row, :]
+            pi_idx_in_class = idx_in_class % self.orig_per_class_num[y]  
+            pi = self.pi_dataset[y][pi_idx_in_class, :]
+            
+            coarse_label = self.fine_to_coarse[y]
+             
+            if self.top_dir is None:  
+                kz_class_options = self.coarse_to_fine[coarse_label]
+                kz_class_numbers = [self.kz_dataset[c].shape[0] for c in kz_class_options]
+                kz_class_probs = np.array(kz_class_numbers) / sum(kz_class_numbers)
+                kz_class = np.random.choice(kz_class_options, p=kz_class_probs)
+                kz_idx_in_class = np.random.randint(self.kz_dataset[kz_class].shape[0])
+                kz = self.kz_dataset[kz_class][kz_idx_in_class, :]
+                
+                # project kz into y's pc
+                kz = (kz - self.kz_info[kz_class]['mean'] +  self.kz_info[y]['mean']) * (self.kz_info[y]['std'] / self.kz_info[kz_class]['std'])
+
             else:
                 kz = np.random.rand(self.top_dir[coarse_label].shape[0]) @ self.top_dir[coarse_label]
-            #kz = self.kz_dataset[coarse_label][pi_row, :] # Turns this into simple over-sampling dataset
+            #kz = self.kz_dataset[y][pi_idx_in_class, :] # Turns this into simple over-sampling dataset
             
-            x = kz + self.pi_dataset[coarse_label][pi_row, :]
+            x = kz + pi
         return x.squeeze().detach(), y
     
 
@@ -476,10 +503,11 @@ class OversampledDataset(Dataset):
 
         return self.dataset[true_idx]
         
-augmented_dataset = ImbanlanceAugmented(pi={k:torch.tensor(v) for k,v in pi_tensor_for_coarse.items()},
-                                        kz={k:torch.tensor(v) for k,v in kz_tensor_for_coarse.items()},
+augmented_dataset = ImbanlanceAugmented(pi={k:torch.tensor(v) for k,v in pi_tensor_for_class.items()},
+                                        kz={k:torch.tensor(v) for k,v in kz_tensor_for_class.items()},
                                         targets=targets_for_coarse,
-                                        fine_to_coarse=coarse_labels,
+                                        #fine_to_coarse=coarse_labels,
+                                        fine_to_coarse=clusters,
                                         #top_dir=top_directions_for_coarse
                                         )
 
@@ -517,16 +545,17 @@ with torch.no_grad():
     classifier.weight += 0.01 * torch.randn_like(classifier.weight)
 
 criterion = torch.nn.CrossEntropyLoss()
-optimizer = torch.optim.SGD(classifier.parameters(), momentum=0.9, lr=1e-3, weight_decay=1e-3)
-scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=30, gamma=0.1)
+optimizer = torch.optim.SGD(classifier.parameters(), momentum=0.9, lr=1e-4, weight_decay=1e-4)
+scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=15, gamma=0.5)
 
+best_acc = 0
 model.eval()
-for epoch in range(10):
-    for batch_idx, (data, target) in enumerate(oversampled_loader):
+for epoch in range(30):
+    for batch_idx, (data, target) in enumerate(augmented_loader):
         classifier.train()
         data, target = data.to(device), target.to(device)
         optimizer.zero_grad()
-        _,_,_,_,data = model(data, train=True, extract_features=True)
+        #_,_,_,_,data = model(data, train=True, extract_features=True)
         outputs = classifier(data)
         loss = criterion(outputs, target.to(torch.long))
         loss.backward()
@@ -561,10 +590,11 @@ for epoch in range(10):
     test_loss = test_loss / test_total
     test_accuracy = correct / total
     print(f"epoch {epoch} | Test accuracy: {test_accuracy} | Test loss: {test_loss:.4f}")
+    
+    best_acc = max(best_acc, test_accuracy)
 
+print(best_acc)
 
-
-#classifier = model.module.fc_cb
 #%%
 count = {i: 0 for i in range(100)}
 for i in range(len(augmented_dataset)):
@@ -581,7 +611,7 @@ for i in range(len(augmented_dataset)):
         count[target] += 1
     
 
-#%%
+#%% Test per class
 criterion = torch.nn.CrossEntropyLoss()
 
 model.eval()
@@ -631,12 +661,7 @@ print()
 print(f"Test accuracy: {test_accuracy}")
 print(f"Test loss: {test_loss}")
 
-#%%
-import torchvision
-test_dataset = torchvision.datasets.CIFAR100(root='./data', train=False, download=True, transform=transform_train)
-test_loader = DataLoader(test_dataset, batch_size=64, shuffle=True)
-
-#%%
+#%% Fine tune for normality of Kz
 
 
 def normality_criterion(x):
@@ -693,7 +718,6 @@ for epoch in range(finetune_epochs):
         try:
             input_invs, target_invs = next(weighted_train_loader)
         except:
-            print('hi!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!')
             weighted_train_loader = iter(trainer.weighted_train_loader)
             input_invs, target_invs = next(weighted_train_loader)
 
@@ -784,195 +808,3 @@ for epoch in range(finetune_epochs):
     }, is_best, epoch + 1)
     """
 model.load_state_dict(best_dict)
-#%%
-if dataset == 'cifar100':
-    coarse_labels = np.array([ 4,  1, 14,  8,  0,  6,  7,  7, 18,  3,  
-                               3, 14,  9, 18,  7, 11,  3,  9,  7, 11,
-                               6, 11,  5, 10,  7,  6, 13, 15,  3, 15,  
-                               0, 11,  1, 10, 12, 14, 16,  9, 11,  5, 
-                               5, 19,  8,  8, 15, 13, 14, 17, 18, 10, 
-                               16, 4, 17,  4,  2,  0, 17,  4, 18, 17, 
-                               10, 3,  2, 12, 12, 16, 12,  1,  9, 19,  
-                               2, 10,  0,  1, 16, 12,  9, 13, 15, 13, 
-                              16, 19,  2,  4,  6, 19,  5,  5,  8, 19, 
-                              18,  1,  2, 15,  6,  0, 17,  8, 14, 13])
-if dataset == 'imagenet':
-    coarse_labels = np.array([0, 0, 1, 1, 1, 0, 0, 2, 2, 2, 2, 2, 2,
-                              2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 3,
-                              3, 3, 3, 3, 4, 4, 4, 5, 5, 5, 5, 5, 6,
-                              6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 7, 7, 8,
-                              9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9,
-                              0, 9, 9, 9, 10, 11, 11, 11, 11, 11, 11,
-                              11, 11, 12, 12, 2, 2, 2, 2, 2, 2, 2, 2,
-                              2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 
-                              13, 14, 14, 15, 15, 15, 0, 16, 16, 12, 12, 17, 
-                              17, 17, 17, 17, 17, 18, 18, 18, 18, 18, 18, 18,
-                              18, 18, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2,
-                              2, 2, 2, 2, 2, 2, 2, 2, 2, 19, 19, 19, 19,
-                              20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20,
-                              20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 
-                              20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20,
-                              20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 21, 21, 21, 21, 21, 21, 20, 21, 21, 21, 21, 21, 22, 23, 22, 22, 22, 23, 23, 23, 23, 23, 23, 23, 23, 24, 24, 24, 25, 26, 26, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 27, 27, 27, 27, 27, 27, 28, 28, 28, 29, 29, 29, 30, 30, 30, 30, 30, 30, 31, 13, 32, 32, 32, 13, 13, 13, 13, 13, 13, 13, 13, 13, 13, 13, 13, 33, 33, 33, 33, 33, 33, 33, 34, 25, 35, 35, 35, 35, 35, 35, 35, 35, 35, 35, 35, 35, 35, 35, 35, 35, 35, 35, 26, 35, 13, 13, 24, 24, 0, 0, 1, 16, 0, 0, 0, 0, 0, 36, 37, 37, 38, 38, 39, 40, 40, 41, 42, 42, 43, 44, 37, 41, 45, 46, 47, 48, 49, 50, 51, 38, 41, 48, 41, 47, 47, 36, 52, 50, 53, 53, 41, 38, 54, 43, 41, 42, 47, 55, 54, 56, 56, 47, 37, 42, 37, 57, 50, 44, 47, 42, 46, 54, 41, 47, 51, 45, 46, 43, 37, 44, 37, 50, 50, 46, 37, 58, 47, 42, 59, 50, 45, 39, 50, 37, 36, 47, 50, 52, 36, 36, 36, 60, 47, 39, 60, 38, 60, 50, 61, 37, 50, 52, 41, 38, 41, 43, 47, 47, 59, 47, 37, 37, 59, 59, 59, 36, 36, 60, 47, 39, 42, 59, 38, 37, 37, 41, 42, 54, 52, 41, 59, 53, 50, 37, 44, 41, 60, 60, 37, 60, 60, 41, 43, 60, 36, 44, 42, 47, 43, 44, 38, 38, 50, 59, 60, 38, 58, 41, 57, 59, 51, 46, 41, 39, 42, 41, 44, 38, 41, 48, 42, 44, 50, 41, 58, 38, 59, 37, 42, 46, 36, 59, 42, 53, 42, 39, 38, 37, 38, 47, 42, 47, 45, 46, 51, 42, 50, 43, 60, 60, 46, 60, 38, 38, 42, 50, 45, 47, 51, 50, 37, 48, 42, 36, 60, 50, 62, 37, 42, 37, 57, 42, 60, 37, 37, 51, 37, 59, 43, 60, 42, 36, 50, 47, 39, 50, 42, 39, 46, 37, 51, 60, 50, 47, 50, 46, 41, 37, 37, 44, 38, 38, 37, 50, 44, 44, 59, 52, 44, 60, 60, 37, 52, 42, 37, 42, 45, 37, 59, 47, 42, 60, 47, 60, 42, 59, 54, 47, 51, 42, 42, 47, 30, 36, 42, 51, 50, 46, 46, 51, 57, 47, 38, 38, 60, 36, 38, 60, 37, 42, 37, 52, 48, 39, 36, 50, 37, 47, 38, 57, 40, 48, 41, 60, 42, 47, 60, 41, 51, 50, 51, 55, 60, 38, 54, 61, 42, 44, 43, 52, 43, 53, 49, 63, 59, 50, 47, 52, 43, 42, 50, 60, 48, 42, 37, 41, 56, 59, 50, 60, 43, 60, 47, 45, 60, 48, 48, 46, 50, 43, 42, 48, 60, 60, 36, 52, 42, 36, 60, 41, 60, 47, 45, 45, 41, 59, 50, 53, 50, 37, 52, 50, 56, 37, 37, 38, 45, 60, 42, 39, 48, 43, 50, 50, 36, 36, 50, 47, 41, 52, 52, 50, 54, 43, 48, 37, 46, 36, 41, 60, 48, 42, 42, 43, 53, 37, 36, 54, 59, 60, 60, 40, 59, 39, 44, 36, 42, 60, 41, 58, 44, 38, 50, 46, 44, 60, 41, 59, 42, 41, 41, 47, 39, 37, 44, 50, 37, 51, 44, 50, 37, 37, 49, 60, 50, 43, 42, 60, 59, 49, 60, 53, 47, 43, 50, 42, 41, 47, 60, 47, 41, 50, 44, 42, 47, 42, 42, 43, 37, 42, 39, 36, 44, 42, 38, 41, 36, 60, 46, 42, 38, 60, 43, 52, 51, 36, 37, 44, 38, 53, 60, 36, 46, 41, 40, 52, 60, 52, 52, 44, 52, 50, 37, 43, 43, 46, 56, 51, 59, 59, 51, 61, 39, 39, 47, 36, 57, 57, 44, 60, 57, 57, 59, 56, 56, 59, 56, 56, 56, 56, 56, 56, 56, 56, 56, 64, 64, 64, 62, 62, 62, 64, 64, 64, 64, 65, 66, 62, 62, 62, 62, 62, 62, 62, 62, 62, 62, 51, 56, 56, 56, 56, 56, 56, 56, 56, 56, 59, 56, 44, 51, 44, 16, 44, 44, 44, 44, 44, 44, 44, 63, 63, 63, 65, 65, 65, 56, 31, 65, 31, 16, 66, 66, 66, 66, 66, 66, 56, 51])
-num_coarse_labels = max(coarse_labels)+1
-fine_labels = [list(np.where(coarse_labels == i)[0])
-               for i in range(num_coarse_labels)]
-
-
-coarse_diffs = [[] for _ in range(num_coarse_labels)]
-for i in range(num_classes):
-    coarse_diffs[coarse_labels[i]].append(diff[i])
-
-import matplotlib.pyplot as plt
-
-# Example: replace this with your real data
-# coarse_diffs = [[...], [...], ..., [...]]  # 20 lists of 5 values each
-
-for i, group in enumerate(coarse_diffs):
-    x = [i] * len(group)
-    plt.scatter(x, group, color='blue')  # One color per group (optional)
-
-plt.xticks(range(len(coarse_diffs)))
-plt.xlabel('Coarse Label Index')
-plt.ylabel('Value')
-plt.title('coarse_diffs per Coarse Class')
-plt.grid(True)
-plt.show()
-
-#%%
-import numpy as np
-import matplotlib.pyplot as plt
-from sklearn.decomposition import PCA
-
-def scatter_pca_pairs(X, label, rows=2, cols=2):
-    pca = PCA()
-    X_pca = pca.fit_transform(X)
-    num_plots = rows * cols
-    
-    fig, axes = plt.subplots(rows, cols, figsize=(4*cols, 4*rows))
-    axes = axes.flatten()
-    
-    unique_labels = sorted(set(label))
-    cmap = plt.get_cmap('tab10')  # Or use 'viridis', 'Set1', 'Dark2', etc.
-    label_to_color = {val: cmap(i) for i, val in enumerate(unique_labels)}
-    color_values = [label_to_color[val] for val in label]
-    
-    for i in range(num_plots):
-        if i + 1 >= X_pca.shape[1]:
-            break
-        ax = axes[i]
-        sc = ax.scatter(X_pca[:, 2*i], X_pca[:,2*i+1], s=10, alpha=0.8, c=color_values, cmap=cmap)
-        ax.set_xlabel(f'PC{i+1}')
-        ax.set_ylabel(f'PC{i+2}')
-        ax.set_title(f'PC{2*i} vs PC{2*i+1}')
-    #plt.legend(*sc.legend_elements(), title="Category", bbox_to_anchor=(1.05, 1), loc='upper left')
-    handles = [plt.Line2D([0], [0], marker='o', linestyle='', color=label_to_color[l], label=str(l))
-               for l in unique_labels]
-    ax.legend(handles=handles, title="Category", bbox_to_anchor=(1.05, 1), loc='upper left')
-
-    plt.tight_layout()
-    plt.show()
-
-"""
-scatter_pca_pairs(np.concatenate(list(kz_tensor_for_coarse.values()), axis=0),
-                  np.concatenate([coarse_labels[[int(t) for t in list(targets_for_coarse[k])]] for k in targets_for_coarse.keys()])
-                  )
-"""
-coarse_label = 14
-scatter_pca_pairs(kz_tensor_for_coarse[coarse_label],targets_for_coarse[coarse_label])
-print(acc_per_coarse[coarse_label])
-
-#%%
-from collections import Counter
-from torch.utils.data import WeightedRandomSampler
-def pretrained_get_features(pretrained_model, x):
-        x = pretrained_model.conv1(x)
-        x = pretrained_model.bn1(x)
-        x = pretrained_model.relu(x)
-        x = pretrained_model.maxpool(x)
-
-        x = pretrained_model.layer1(x)
-        x = pretrained_model.layer2(x)
-        x = pretrained_model.layer3(x)
-        x = pretrained_model.layer4(x)
-
-        x = pretrained_model.avgpool(x)
-        x = torch.flatten(x, 1)
-        x = pretrained_model.fc[0](x)
-        return x
-
-import torchvision.models as models
-pretrained_model = models.resnet50(pretrained=True).to(device)
-pretrained_model.eval()
-
-# Basic transform for ResNet-50 (trained on ImageNet)
-transform = transforms.Compose([
-    transforms.Resize(224),
-    transforms.ToTensor(),
-    transforms.Normalize(mean=[0.485, 0.456, 0.406],
-                         std=[0.229, 0.224, 0.225])
-])
-
-if dataset == 'cifar10':
-    train_dataset = cifar10Imbanlance.Cifar10Imbanlance(transform=transform_val,
-                                                        imbanlance_rate=args.imbanlance_rate,
-                                                        train=True,
-                                                        file_path=args.root,
-                                                        print_on_creation=False
-                                                        )
-    
-if dataset == 'cifar100':
-    train_dataset = cifar100Imbanlance.Cifar100Imbanlance(transform=transform_val,
-                                                          imbanlance_rate=args.imbanlance_rate,
-                                                          train=True,
-                                                          file_path=os.path.join('data/','cifar-100-python/'),
-                                                          print_on_creation=False
-                                                          )
-
-if dataset == 'ImageNet-LT':
-    train_dataset = dataset_lt_data.LT_Dataset(args.root, 'data/data_txt/ImageNet_LT_train.txt',transform_val)
-
-labels = [label for _, label in train_dataset]  # train_dataset is your CIFAR-10-LT
-class_counts = Counter(labels)
-max_count = max(class_counts.values())
-weights = [max_count / class_counts[label] for _, label in train_dataset]
-sampler = WeightedRandomSampler(weights, num_samples=len(train_dataset), replacement=True)
-train_loader = DataLoader(train_dataset, batch_size=64, sampler=sampler, num_workers=4)
-#train_loader = DataLoader(train_dataset, batch_size=64, shuffle=True, num_workers=4)
-
-pretrained_model.fc = torch.nn.Sequential(torch.nn.Linear(pretrained_model.fc.in_features, 256), torch.nn.Linear(256, 10)).to(device)
-
-criterion = torch.nn.CrossEntropyLoss()
-optimizer = torch.optim.SGD(pretrained_model.parameters(), lr=0.01, momentum=0.9, weight_decay=1e-4)
-scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=15, gamma=0.1)
-
-for epoch in range(10):  # adjust epochs as needed
-    pretrained_model.train()
-    total_loss = 0
-    for images, labels in train_loader:
-        images, labels = images.to(device), labels.to(device)
-        
-        optimizer.zero_grad()
-        outputs = pretrained_model(images)
-        loss = criterion(outputs, labels)
-        loss.backward()
-        optimizer.step()
-
-        total_loss += loss.item()
-    
-    print(f"Epoch [{epoch+1}/10] Loss: {total_loss:.4f}")
-    scheduler.step()
-    
-    pretrained_model.eval()
-    correct = 0
-    total = 0
-    with torch.no_grad():
-        for images, labels in val_loader:
-            images, labels = images.to(device), labels.to(device)
-            outputs = pretrained_model(images)
-            _, predicted = torch.max(outputs.data, 1)
-            total += labels.size(0)
-            correct += (predicted == labels).sum().item()
-    
-    print(f"Validation Accuracy: {100 * correct / total:.2f}%")
-
-#%%
