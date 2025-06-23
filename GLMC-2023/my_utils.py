@@ -185,3 +185,66 @@ for cluster_id in range(k):
     for i in chosen:
         assignments[i] = cluster_id
     available = [i for i in available if i not in chosen]
+    
+#%%
+import dill
+from torchvision.datasets import CIFAR100
+
+feature_dim = model.module.fc_cb.in_features
+fc = model.module.fc_cb
+model.eval()
+
+train_dataset = CIFAR100(root='./data', train=True, download=True, transform=transform_val)
+with torch.no_grad():
+    #model = model.cpu()
+    kz_tensor_for_class = defaultdict(lambda: torch.zeros(0, feature_dim))
+    pi_tensor_for_class = defaultdict(lambda: torch.zeros(0, feature_dim))
+
+    for i in range(len(train_dataset)):
+        data, target = train_dataset[i]
+        data = data.to(device).unsqueeze(0)
+        
+        _, _, _, _, features = model.module(data, train=True, extract_features=True)
+        outputs = fc(features)
+        
+        pi = (torch.linalg.pinv(fc.weight.data) @ (outputs - fc.bias.data).T).T
+        kz = features - pi
+        kz_tensor_for_class[target] = np.concatenate((kz_tensor_for_class[target], kz.cpu().numpy()), axis=0)
+        pi_tensor_for_class[target] = np.concatenate((pi_tensor_for_class[target], pi.cpu().numpy()), axis=0)
+        
+    model.to(device)
+
+with open("full_kz.pkl", "wb") as f:
+    dill.dump(kz_tensor_for_class, f)
+with open("full_pi.pkl", "wb") as f:
+    dill.dump(pi_tensor_for_class, f)
+    
+train_dataset = cifar100Imbanlance.Cifar100Imbanlance(transform=transform_val,
+                                                      imbanlance_rate=args.imbanlance_rate,
+                                                      train=True,
+                                                      file_path=os.path.join('data/','cifar-100-python/')
+                                                      )
+with torch.no_grad():
+    #model = model.cpu()
+    kz_tensor_for_class = defaultdict(lambda: torch.zeros(0, feature_dim))
+    pi_tensor_for_class = defaultdict(lambda: torch.zeros(0, feature_dim))
+
+    for i in range(len(train_dataset)):
+        data, target = train_dataset[i]
+        data = data.to(device).unsqueeze(0)
+        
+        _, _, _, _, features = model.module(data, train=True, extract_features=True)
+        outputs = fc(features)
+        
+        pi = (torch.linalg.pinv(fc.weight.data) @ (outputs - fc.bias.data).T).T
+        kz = features - pi
+        kz_tensor_for_class[target] = np.concatenate((kz_tensor_for_class[target], kz.cpu().numpy()), axis=0)
+        pi_tensor_for_class[target] = np.concatenate((pi_tensor_for_class[target], pi.cpu().numpy()), axis=0)
+        
+    model.to(device)
+
+with open("lt_kz.pkl", "wb") as f:
+    dill.dump(kz_tensor_for_class, f)
+with open("lt_pi.pkl", "wb") as f:
+    dill.dump(pi_tensor_for_class, f)
+

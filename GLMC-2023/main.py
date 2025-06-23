@@ -808,3 +808,128 @@ for epoch in range(finetune_epochs):
     }, is_best, epoch + 1)
     """
 model.load_state_dict(best_dict)
+
+#%% FIne tune for center loss
+
+class WeightedCenterLoss(torch.nn.Module):
+    def __init__(self, num_classes, feat_dim, class_weights=None, device='cpu', alpha=0.5):
+        super().__init__()
+        self.num_classes = num_classes
+        self.feat_dim = feat_dim
+        self.device = device
+        self.alpha = alpha  # learning rate for center update
+
+        self.centers = torch.nn.Parameter(torch.randn(num_classes, feat_dim).to(device), requires_grad=False)
+
+        if class_weights is not None:
+            self.class_weights = class_weights.to(device)
+        else:
+            self.class_weights = torch.ones(num_classes, device=device)
+
+    def forward(self, features, labels):
+        batch_size = features.size(0)
+        centers_batch = self.centers[labels]  # [B, feat_dim]
+        loss = (features - centers_batch).pow(2).sum(dim=1)  # [B]
+
+        weights = self.class_weights[labels]  # [B]
+        weighted_loss = loss * weights
+
+        # Manual center update (no gradient)
+        with torch.no_grad():
+            for i in range(batch_size):
+                label = labels[i]
+                diff = self.centers[label] - features[i]
+                self.centers[label] -= self.alpha * diff
+
+        return weighted_loss.mean()
+
+if dataset == 'cifar10':
+    train_dataset = cifar10Imbanlance.Cifar10Imbanlance(transform=transform_val,imbanlance_rate=args.imbanlance_rate, train=True,file_path=args.root)
+    num_classes=10
+    feat_dim=256
+    
+if dataset == 'cifar100':
+    train_dataset = cifar100Imbanlance.Cifar100Imbanlance(transform=transform_val,
+                                                          imbanlance_rate=args.imbanlance_rate,
+                                                          train=True,
+                                                          file_path=os.path.join('data/','cifar-100-python/')
+                                                          )
+    num_classes=100
+    feat_dim=256
+
+if dataset == 'ImageNet-LT':
+    train_dataset = dataset_lt_data.LT_Dataset(args.root, 'data/data_txt/ImageNet_LT_train.txt',transform_val)
+    
+    
+train_loader = torch.utils.data.DataLoader(train_dataset,
+                                           batch_size=args.batch_size,
+                                           shuffle=(train_sampler is None),
+                                           num_workers=4,
+                                           persistent_workers=True,
+                                           pin_memory=True,
+                                           sampler=train_sampler)
+
+class_weights = 1.0 / trainer.cls_num_list
+class_weights = class_weights / np.sum(class_weights) * len(class_weights)
+class_weights = torch.tensor(class_weights).to(device).to(torch.float)
+center_loss_criterion = WeightedCenterLoss(num_classes, feat_dim, class_weights=class_weights, device=device)
+criterion = torch.nn.CrossEntropyLoss(weight=class_weights)
+lambda_center = 0.05
+
+best_acc = 0
+optimizer = torch.optim.Adam(model.parameters(), lr=1e-5)
+num_epochs=15
+for epoch in range(num_epochs):
+    model.train()
+    running_loss = 0.0
+
+    for data, labels in train_loader:
+        data = data.to(device)
+        labels = labels.to(device)
+
+        optimizer.zero_grad()
+
+        # Forward pass
+        _, _, _, _, features = model.module(data, train=True, extract_features=True)
+        outputs = model.module.fc_cb(features)
+        pi = (torch.linalg.pinv(model.module.fc_cb.weight.data) @ (outputs - model.module.fc_cb.bias.data).T).T
+        
+
+        # Compute losses
+        ce_loss = criterion(outputs, labels)
+        center_loss = center_loss_criterion(pi, labels)
+
+        # Combine
+        total_loss = ce_loss + lambda_center * center_loss
+
+        # Backward + optimize
+        total_loss.backward()
+        optimizer.step()
+
+        running_loss += total_loss.item()
+
+    print(f"Epoch {epoch+1}: Loss = {running_loss/len(train_loader):.4f}")
+    
+    
+    model.eval()
+    test_loss = 0
+    correct = 0
+    total = 0
+    test_total = 0
+    with torch.no_grad():
+        for data, target in val_loader:
+            data, target = data.to(device), target.to(device)
+            data, target = data.squeeze(0), target.squeeze(0)
+            _, output, _, _, features = model(data, train=True, extract_features=True)
+            loss = criterion(output, target.to(torch.long))
+            test_loss += loss.item()
+            test_total += 1
+            pred = output.argmax(dim=1, keepdim=True)
+            correct += pred.eq(target.view_as(pred)).sum().item()
+            total += len(target)
+            
+    test_loss = test_loss / test_total
+    test_accuracy = correct / total
+    print(f"epoch {epoch+1} | Test accuracy: {test_accuracy} | Test loss: {test_loss:.4f}")
+    
+    best_acc = max(best_acc, test_accuracy)
