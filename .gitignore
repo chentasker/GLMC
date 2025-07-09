@@ -1,1 +1,6 @@
 /GLMC-2023/data/*
+/GLMC-2023/GLMC-CVPR2023/output/*
+/GLMC-2023/__pycache__/*
+/GLMC-2023/imbalance_data/__pycache__/*
+/GLMC-2023/model/__pycache__/*
+/GLMC-2023/utils/__pycache__/*
